@@ -65,7 +65,7 @@ func main() {
 			_ = os.MkdirAll(demoDir, 0o750)
 			// make demo disk images eligible as wipe targets
 			cfg.DevicePathPrefix = demoDir + "," + cfg.DevicePathPrefix
-			if _, err := mem.SeedDemoDisks(ctx, demoDir, "demo-operator"); err != nil {
+			if _, err := mem.SeedDemoDisks(ctx, demoDir, "demo-operator", "nist_purge"); err != nil {
 				logger.Fatalf("seed demo: %v", err)
 			}
 			logger.Printf("demo data ready under %s", demoDir)

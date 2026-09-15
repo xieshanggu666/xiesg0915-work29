@@ -109,7 +109,10 @@ func runDemo(ctx context.Context, args []string, logger *log.Logger) {
 		logger.Fatal(err)
 	}
 	_ = obj.EnsureBucket(ctx)
-	assetID, err := st.SeedDemoDisks(ctx, diskDir, "demo-operator")
+	if _, err := domain.GetStandard(*standard); err != nil {
+		logger.Fatal(err)
+	}
+	assetID, err := st.SeedDemoDisks(ctx, diskDir, "demo-operator", *standard)
 	if err != nil {
 		logger.Fatal(err)
 	}

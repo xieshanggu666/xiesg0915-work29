@@ -592,6 +592,170 @@ FROM disposal_confirmations WHERE asset_id=$1`, assetID).
 	return d, mapErr(err)
 }
 
+// ---- decommission approvals ----
+
+const approvalCols = `id,asset_id,asset_tag,standard,method,reason,applicant,status,reviewer,review_note,reviewed_at,version,created_at,updated_at`
+
+func scanApproval(row pgx.Row) (domain.DecommissionApproval, error) {
+	var a domain.DecommissionApproval
+	err := row.Scan(&a.ID, &a.AssetID, &a.AssetTag, &a.Standard, &a.Method, &a.Reason,
+		&a.Applicant, &a.Status, &a.Reviewer, &a.ReviewNote, &a.ReviewedAt,
+		&a.Version, &a.CreatedAt, &a.UpdatedAt)
+	return a, err
+}
+
+func (p *Postgres) CreateApproval(ctx context.Context, a domain.DecommissionApproval) error {
+	if a.ID == "" {
+		a.ID = domain.ID()
+	}
+	if a.Status == "" {
+		a.Status = domain.ApprovalPending
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// uniq_active_approval (partial unique index) rejects a second open
+	// request for the same asset even under concurrent submits.
+	err = tx.QueryRow(ctx, `
+INSERT INTO decommission_approvals(id,asset_id,asset_tag,standard,method,reason,applicant,status,version)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING created_at,updated_at`,
+		a.ID, a.AssetID, a.AssetTag, a.Standard, a.Method, a.Reason,
+		a.Applicant, string(a.Status), a.Version).Scan(&a.CreatedAt, &a.UpdatedAt)
+	if err != nil {
+		return mapErr(err)
+	}
+	if err := appendAuditTx(ctx, tx, domain.AuditLog{
+		Actor: a.Applicant, Action: "approval.submit", EntityType: "approval", EntityID: a.ID,
+		Detail: fmt.Sprintf("提交退役审批 asset=%s standard=%s method=%s version=%d", a.AssetTag, a.Standard, a.Method, a.Version),
+	}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) GetApproval(ctx context.Context, id string) (domain.DecommissionApproval, error) {
+	a, err := scanApproval(p.pool.QueryRow(ctx,
+		`SELECT `+approvalCols+` FROM decommission_approvals WHERE id=$1`, id))
+	return a, mapErr(err)
+}
+
+func (p *Postgres) GetActiveApproval(ctx context.Context, assetID string) (domain.DecommissionApproval, error) {
+	a, err := scanApproval(p.pool.QueryRow(ctx, `
+SELECT `+approvalCols+` FROM decommission_approvals
+WHERE asset_id=$1 AND status IN ('pending','approved')
+ORDER BY created_at DESC LIMIT 1`, assetID))
+	return a, mapErr(err)
+}
+
+func (p *Postgres) ListApprovals(ctx context.Context, assetID string) ([]domain.DecommissionApproval, error) {
+	q := `SELECT ` + approvalCols + ` FROM decommission_approvals`
+	var args []any
+	if assetID != "" {
+		q += ` WHERE asset_id=$1`
+		args = append(args, assetID)
+	}
+	q += ` ORDER BY created_at DESC`
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.DecommissionApproval{}
+	for rows.Next() {
+		a, err := scanApproval(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) ReviewApproval(ctx context.Context, id string, to domain.ApprovalStatus, reviewer, note string) (domain.DecommissionApproval, error) {
+	if to != domain.ApprovalApproved && to != domain.ApprovalRejected {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: review target must be approved|rejected", ErrConflict)
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.DecommissionApproval{}, err
+	}
+	defer tx.Rollback(ctx)
+	a, err := scanApproval(tx.QueryRow(ctx,
+		`SELECT `+approvalCols+` FROM decommission_approvals WHERE id=$1 FOR UPDATE`, id))
+	if err != nil {
+		return a, mapErr(err)
+	}
+	if err := domain.CanTransitionApproval(a.Status, to); err != nil {
+		return a, fmt.Errorf("%w: %v", ErrConflict, err)
+	}
+	a, err = scanApproval(tx.QueryRow(ctx, `
+UPDATE decommission_approvals
+SET status=$2, reviewer=$3, review_note=$4, reviewed_at=now(), updated_at=now()
+WHERE id=$1 RETURNING `+approvalCols, id, string(to), reviewer, note))
+	if err != nil {
+		return a, mapErr(err)
+	}
+	action := "approval.approve"
+	if to == domain.ApprovalRejected {
+		action = "approval.reject"
+	}
+	if err := appendAuditTx(ctx, tx, domain.AuditLog{
+		Actor: reviewer, Action: action, EntityType: "approval", EntityID: id,
+		Detail: fmt.Sprintf("审核退役审批 asset=%s 结论=%s 意见=%s", a.AssetTag, to, note),
+	}); err != nil {
+		return a, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return a, err
+	}
+	return a, nil
+}
+
+func (p *Postgres) WithdrawApproval(ctx context.Context, id, actor string) (domain.DecommissionApproval, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return domain.DecommissionApproval{}, err
+	}
+	defer tx.Rollback(ctx)
+	a, err := scanApproval(tx.QueryRow(ctx,
+		`SELECT `+approvalCols+` FROM decommission_approvals WHERE id=$1 FOR UPDATE`, id))
+	if err != nil {
+		return a, mapErr(err)
+	}
+	if err := domain.CanTransitionApproval(a.Status, domain.ApprovalWithdrawn); err != nil {
+		return a, fmt.Errorf("%w: %v", ErrConflict, err)
+	}
+	// 执行前才能撤回：审批通过后资产一旦开始执行（拆盘及以后）即不可撤回
+	if a.Status == domain.ApprovalApproved {
+		var st domain.AssetStatus
+		if err := tx.QueryRow(ctx, `SELECT status FROM assets WHERE id=$1`, a.AssetID).Scan(&st); err != nil {
+			return a, mapErr(err)
+		}
+		if st != domain.AssetPending {
+			return a, fmt.Errorf("%w: execution already started (asset=%s), approval cannot be withdrawn",
+				ErrConflict, st)
+		}
+	}
+	a, err = scanApproval(tx.QueryRow(ctx, `
+UPDATE decommission_approvals SET status='withdrawn', updated_at=now()
+WHERE id=$1 RETURNING `+approvalCols, id))
+	if err != nil {
+		return a, mapErr(err)
+	}
+	if err := appendAuditTx(ctx, tx, domain.AuditLog{
+		Actor: actor, Action: "approval.withdraw", EntityType: "approval", EntityID: id,
+		Detail: fmt.Sprintf("撤回退役审批 asset=%s version=%d", a.AssetTag, a.Version),
+	}); err != nil {
+		return a, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return a, err
+	}
+	return a, nil
+}
+
 // ---- audit ----
 
 func appendAuditTx(ctx context.Context, tx pgx.Tx, l domain.AuditLog) error {
@@ -664,7 +828,7 @@ func (p *Postgres) ListAudit(ctx context.Context, f AuditFilter) ([]domain.Audit
 
 // SeedDemoDisks is unsupported on Postgres; use the demo CLI against the
 // in-memory store, or register real hardware through the API.
-func (p *Postgres) SeedDemoDisks(ctx context.Context, dir string, operator string) (string, error) {
+func (p *Postgres) SeedDemoDisks(ctx context.Context, dir string, operator string, standard string) (string, error) {
 	return "", errors.New("SeedDemoDisks is only supported in memory/demo mode")
 }
 

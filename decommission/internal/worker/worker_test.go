@@ -74,6 +74,8 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 }
 
 // registerAssetWithDisks builds an asset in disk_pulled state with n disks.
+// It walks the real gate: owner submits the decommission approval, the
+// security officer approves, then disks are pulled.
 func (h *harness) registerAssetWithDisks(t *testing.T, n int, size int64) domain.Asset {
 	t.Helper()
 	ctx := context.Background()
@@ -82,6 +84,15 @@ func (h *harness) registerAssetWithDisks(t *testing.T, n int, size int64) domain
 		SN: domain.ID()[:10], Room: "DC-A", Rack: "R1", Owner: "ops", Operator: "alice",
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	ap, err := h.svc.SubmitApproval(ctx, a.ID, service.ApprovalInput{
+		Standard: "nist_clear", Method: "destroy", Reason: "到达退役周期", Operator: "ops",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.ReviewApproval(ctx, ap.ID, "sec-officer", true, "同意退役"); err != nil {
 		t.Fatal(err)
 	}
 	var inputs []service.DiskInput

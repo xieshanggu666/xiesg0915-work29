@@ -212,6 +212,53 @@ type DisposalConfirmation struct {
 	SignedAt    time.Time `json:"signed_at"`
 }
 
+// ---- Decommission approval (退役审批单) ----
+
+// ApprovalStatus is the lifecycle of a decommission approval request.
+// The allowed transitions are declared in ApprovalTransitions below.
+type ApprovalStatus string
+
+const (
+	ApprovalPending   ApprovalStatus = "pending"   // 待安全员审核
+	ApprovalApproved  ApprovalStatus = "approved"  // 审核通过，允许拆盘/擦除/签收
+	ApprovalRejected  ApprovalStatus = "rejected"  // 已驳回（终态，可重新提交新单）
+	ApprovalWithdrawn ApprovalStatus = "withdrawn" // 执行前申请人撤回（终态）
+)
+
+// ApprovalTransitions is the allowed state machine for an approval request.
+// 驳回重提 / 撤回重提都通过新建审批单完成（旧单保留为历史），因此这里
+// rejected/withdrawn 没有出边。
+var ApprovalTransitions = map[ApprovalStatus]map[ApprovalStatus]bool{
+	ApprovalPending:  {ApprovalApproved: true, ApprovalRejected: true, ApprovalWithdrawn: true},
+	ApprovalApproved: {ApprovalWithdrawn: true},
+}
+
+// DecommissionApproval is one submitted 退役审批单. An asset may resubmit
+// after a rejection/withdrawal; every submission is a new row with Version
+// incremented, so the full review history stays queryable.
+type DecommissionApproval struct {
+	ID         string         `json:"id"`
+	AssetID    string         `json:"asset_id"`
+	AssetTag   string         `json:"asset_tag"`
+	Standard   string         `json:"standard"`  // 申请的擦除标准
+	Method     string         `json:"method"`    // 申请的处置方式 reuse/resale/destroy
+	Reason     string         `json:"reason"`    // 退役原因
+	Applicant  string         `json:"applicant"` // 申请人（资产负责人）
+	Status     ApprovalStatus `json:"status"`
+	Reviewer   string         `json:"reviewer,omitempty"`    // 审核人（安全员）
+	ReviewNote string         `json:"review_note,omitempty"` // 审核意见
+	ReviewedAt *time.Time     `json:"reviewed_at,omitempty"`
+	Version    int            `json:"version"` // 第几次提交（驳回/撤回后重提递增）
+	CreatedAt  time.Time      `json:"created_at"`
+	UpdatedAt  time.Time      `json:"updated_at"`
+}
+
+// Active reports whether the approval still gates execution: pending (awaiting
+// review) or approved (execution unlocked). Rejected/withdrawn are history.
+func (a DecommissionApproval) Active() bool {
+	return a.Status == ApprovalPending || a.Status == ApprovalApproved
+}
+
 // ---- Audit log (审计, append-only) ----
 
 type AuditLog struct {

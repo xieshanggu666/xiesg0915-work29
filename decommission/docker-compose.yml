@@ -35,7 +35,7 @@ services:
     environment:
       PGPASSWORD: decommission
     entrypoint: >
-      sh -c "psql -h postgres -U decommission -d decommission -f /sql/0001_init.sql && echo MIGRATION_OK"
+      sh -c "psql -h postgres -U decommission -d decommission -f /sql/0001_init.sql -f /sql/0002_approvals.sql && echo MIGRATION_OK"
     volumes:
       - ./migrations:/sql:ro
     restart: "no"

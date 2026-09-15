@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -47,6 +48,127 @@ func (s *Service) RegisterAsset(ctx context.Context, in RegisterInput) (domain.A
 	return s.St.GetAssetByTag(ctx, in.Tag)
 }
 
+// ---- 退役审批单 ----
+
+// ApprovalInput is a decommission request submitted by the asset owner.
+type ApprovalInput struct {
+	Standard string `json:"standard"` // 申请的擦除标准
+	Method   string `json:"method"`   // 申请的处置方式 reuse/resale/destroy
+	Reason   string `json:"reason"`   // 退役原因
+	Operator string `json:"-"`        // from X-Operator header
+}
+
+// SubmitApproval files a decommission request for an asset. The applicant
+// must be the asset owner (资产负责人提交); the asset must not have started
+// execution and must have no other open request. Re-submission after a
+// rejection/withdrawal creates a new row with version+1 (驳回重提).
+func (s *Service) SubmitApproval(ctx context.Context, assetID string, in ApprovalInput) (domain.DecommissionApproval, error) {
+	if in.Operator == "" {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: operator is required (X-Operator header)", store.ErrConflict)
+	}
+	a, err := s.St.GetAsset(ctx, assetID)
+	if err != nil {
+		return domain.DecommissionApproval{}, err
+	}
+	if a.Owner != "" && in.Operator != a.Owner {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: only the asset owner (%s) may submit the decommission request", store.ErrConflict, a.Owner)
+	}
+	if a.Status != domain.AssetPending {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: asset %s already in execution (status=%s); cannot submit approval",
+			store.ErrConflict, assetID, a.Status)
+	}
+	std, err := domain.GetStandard(in.Standard)
+	if err != nil {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: %v", store.ErrConflict, err)
+	}
+	switch in.Method {
+	case "reuse", "resale", "destroy":
+	default:
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: method must be reuse|resale|destroy", store.ErrConflict)
+	}
+	if _, err := s.St.GetActiveApproval(ctx, assetID); err == nil {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: asset already has an active approval; withdraw it before resubmitting", store.ErrConflict)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return domain.DecommissionApproval{}, err
+	}
+	version := 1
+	if prev, err := s.St.ListApprovals(ctx, assetID); err == nil {
+		for _, p := range prev {
+			if p.Version >= version {
+				version = p.Version + 1
+			}
+		}
+	}
+	ap := domain.DecommissionApproval{
+		ID: domain.ID(), AssetID: assetID, AssetTag: a.Tag,
+		Standard: std.Code, Method: in.Method, Reason: in.Reason,
+		Applicant: in.Operator, Status: domain.ApprovalPending, Version: version,
+	}
+	if err := s.St.CreateApproval(ctx, ap); err != nil {
+		return domain.DecommissionApproval{}, err
+	}
+	return s.St.GetApproval(ctx, ap.ID)
+}
+
+// ReviewApproval is the security officer's decision on a pending request.
+// 禁止申请人自审: the reviewer must differ from the applicant. Rejection
+// requires a note so the owner knows what to fix before resubmitting.
+func (s *Service) ReviewApproval(ctx context.Context, approvalID, reviewer string, approve bool, note string) (domain.DecommissionApproval, error) {
+	if reviewer == "" {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: operator is required (X-Operator header)", store.ErrConflict)
+	}
+	ap, err := s.St.GetApproval(ctx, approvalID)
+	if err != nil {
+		return domain.DecommissionApproval{}, err
+	}
+	if ap.Status != domain.ApprovalPending {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: approval is %s, only pending requests can be reviewed", store.ErrConflict, ap.Status)
+	}
+	if reviewer == ap.Applicant {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: applicant cannot review their own request (禁止自审)", store.ErrConflict)
+	}
+	to := domain.ApprovalApproved
+	if !approve {
+		to = domain.ApprovalRejected
+		if note == "" {
+			return domain.DecommissionApproval{}, fmt.Errorf("%w: review note is required when rejecting", store.ErrConflict)
+		}
+	}
+	return s.St.ReviewApproval(ctx, approvalID, to, reviewer, note)
+}
+
+// WithdrawApproval cancels an open request. Only the applicant may withdraw,
+// and only before execution has started (asset still pending — 执行前撤回).
+func (s *Service) WithdrawApproval(ctx context.Context, approvalID, operator string) (domain.DecommissionApproval, error) {
+	if operator == "" {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: operator is required (X-Operator header)", store.ErrConflict)
+	}
+	ap, err := s.St.GetApproval(ctx, approvalID)
+	if err != nil {
+		return domain.DecommissionApproval{}, err
+	}
+	if operator != ap.Applicant {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: only the applicant (%s) may withdraw the request", store.ErrConflict, ap.Applicant)
+	}
+	return s.St.WithdrawApproval(ctx, approvalID, operator)
+}
+
+// approvedApproval returns the asset's approved decommission approval, or a
+// conflict error blocking execution: 审批通过前禁止拆盘、擦除与签收。
+func (s *Service) approvedApproval(ctx context.Context, assetID string) (domain.DecommissionApproval, error) {
+	ap, err := s.St.GetActiveApproval(ctx, assetID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ap, fmt.Errorf("%w: asset has no approved decommission request; submit one and pass security review first (未提交退役审批)", store.ErrConflict)
+		}
+		return ap, err
+	}
+	if ap.Status != domain.ApprovalApproved {
+		return ap, fmt.Errorf("%w: decommission approval is %s; execution is allowed only after security review passes", store.ErrConflict, ap.Status)
+	}
+	return ap, nil
+}
+
 // DiskInput describes one pulled disk.
 type DiskInput struct {
 	Serial     string `json:"serial"`
@@ -73,6 +195,10 @@ func (s *Service) PullDisks(ctx context.Context, assetID, operator string, disks
 	if a.Status != domain.AssetPending {
 		return domain.Asset{}, nil, fmt.Errorf("%w: can only pull disks while asset is pending (current=%s)",
 			store.ErrConflict, a.Status)
+	}
+	// 审批通过后才允许拆盘
+	if _, err := s.approvedApproval(ctx, assetID); err != nil {
+		return domain.Asset{}, nil, err
 	}
 	now := time.Now()
 	var created []domain.Disk
@@ -120,6 +246,15 @@ func (s *Service) CreateErasureJob(ctx context.Context, diskID, standard, operat
 	default:
 		return domain.ErasureJob{}, fmt.Errorf("%w: disk %s is %s, cannot queue job",
 			store.ErrConflict, diskID, d.Status)
+	}
+	// 审批通过后才允许擦除，且擦除标准必须与审批通过的标准一致
+	ap, err := s.approvedApproval(ctx, d.AssetID)
+	if err != nil {
+		return domain.ErasureJob{}, err
+	}
+	if ap.Standard != std.Code {
+		return domain.ErasureJob{}, fmt.Errorf("%w: erasure standard %s does not match the approved standard %s",
+			store.ErrConflict, std.Code, ap.Standard)
 	}
 	// attempt = number of prior jobs for this disk
 	prior, err := s.St.ListJobs(ctx, diskID)
@@ -221,6 +356,18 @@ func (s *Service) ConfirmDisposal(ctx context.Context, assetID string, in Dispos
 	default:
 		return domain.DisposalConfirmation{}, fmt.Errorf("%w: asset not ready for disposal (status=%s)",
 			store.ErrConflict, a.Status)
+	}
+	// 审批通过后才允许签收，且处置方式须与审批一致；
+	// 例外：设备已报废（scrapped）时允许按 destroy 签收——物理销毁是
+	// 报废资产唯一可行的终态，原计划（如转售）已因擦除失败失效。
+	ap, err := s.approvedApproval(ctx, assetID)
+	if err != nil {
+		return domain.DisposalConfirmation{}, err
+	}
+	scrappedDestroy := a.Status == domain.AssetScrapped && in.Method == "destroy"
+	if in.Method != ap.Method && !scrappedDestroy {
+		return domain.DisposalConfirmation{}, fmt.Errorf("%w: disposal method %s does not match the approved method %s",
+			store.ErrConflict, in.Method, ap.Method)
 	}
 	conf := domain.DisposalConfirmation{
 		AssetID: assetID, AssetTag: a.Tag, Method: in.Method,

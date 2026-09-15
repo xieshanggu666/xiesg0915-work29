@@ -66,3 +66,14 @@ func CanTransitionAsset(from, to AssetStatus) error {
 	}
 	return fmt.Errorf("illegal asset transition %s -> %s", from, to)
 }
+
+// CanTransitionApproval validates an approval status change.
+func CanTransitionApproval(from, to ApprovalStatus) error {
+	if from == to {
+		return nil
+	}
+	if allowed, ok := ApprovalTransitions[from]; ok && allowed[to] {
+		return nil
+	}
+	return fmt.Errorf("illegal approval transition %s -> %s", from, to)
+}

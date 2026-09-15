@@ -26,6 +26,7 @@ type Memory struct {
 	runs        map[string][]domain.ErasureRun
 	certs       map[string]domain.Certificate
 	disposals   map[string]domain.DisposalConfirmation
+	approvals   map[string]domain.DecommissionApproval
 	audit       []domain.AuditLog
 }
 
@@ -39,6 +40,7 @@ func NewMemory() *Memory {
 		runs:        map[string][]domain.ErasureRun{},
 		certs:       map[string]domain.Certificate{},
 		disposals:   map[string]domain.DisposalConfirmation{},
+		approvals:   map[string]domain.DecommissionApproval{},
 	}
 }
 
@@ -465,6 +467,123 @@ func (m *Memory) GetDisposal(ctx context.Context, assetID string) (domain.Dispos
 	return d, nil
 }
 
+// ---- decommission approvals ----
+
+func (m *Memory) CreateApproval(ctx context.Context, a domain.DecommissionApproval) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.assets[a.AssetID]; !ok {
+		return fmt.Errorf("%w: asset %s", ErrNotFound, a.AssetID)
+	}
+	for _, ap := range m.approvals {
+		if ap.AssetID == a.AssetID && ap.Active() {
+			return fmt.Errorf("%w: asset %s already has an active approval (%s)", ErrConflict, a.AssetID, ap.Status)
+		}
+	}
+	if a.ID == "" {
+		a.ID = domain.ID()
+	}
+	if a.Status == "" {
+		a.Status = domain.ApprovalPending
+	}
+	now := time.Now()
+	a.CreatedAt, a.UpdatedAt = now, now
+	m.approvals[a.ID] = a
+	m.appendAuditLocked(domain.AuditLog{
+		Actor: a.Applicant, Action: "approval.submit",
+		EntityType: "approval", EntityID: a.ID,
+		Detail: fmt.Sprintf("提交退役审批 asset=%s standard=%s method=%s version=%d", a.AssetTag, a.Standard, a.Method, a.Version),
+	})
+	return nil
+}
+
+func (m *Memory) GetApproval(ctx context.Context, id string) (domain.DecommissionApproval, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.approvals[id]
+	if !ok {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: approval %s", ErrNotFound, id)
+	}
+	return a, nil
+}
+
+func (m *Memory) GetActiveApproval(ctx context.Context, assetID string) (domain.DecommissionApproval, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.approvals {
+		if a.AssetID == assetID && a.Active() {
+			return a, nil
+		}
+	}
+	return domain.DecommissionApproval{}, fmt.Errorf("%w: no active approval for asset %s", ErrNotFound, assetID)
+}
+
+func (m *Memory) ListApprovals(ctx context.Context, assetID string) ([]domain.DecommissionApproval, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []domain.DecommissionApproval{}
+	for _, a := range m.approvals {
+		if assetID == "" || a.AssetID == assetID {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *Memory) ReviewApproval(ctx context.Context, id string, to domain.ApprovalStatus, reviewer, note string) (domain.DecommissionApproval, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.approvals[id]
+	if !ok {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: approval %s", ErrNotFound, id)
+	}
+	if to != domain.ApprovalApproved && to != domain.ApprovalRejected {
+		return a, fmt.Errorf("%w: review target must be approved|rejected", ErrConflict)
+	}
+	if err := domain.CanTransitionApproval(a.Status, to); err != nil {
+		return a, fmt.Errorf("%w: %v", ErrConflict, err)
+	}
+	now := time.Now()
+	a.Status, a.Reviewer, a.ReviewNote, a.ReviewedAt, a.UpdatedAt = to, reviewer, note, &now, now
+	m.approvals[id] = a
+	action := "approval.approve"
+	if to == domain.ApprovalRejected {
+		action = "approval.reject"
+	}
+	m.appendAuditLocked(domain.AuditLog{
+		Actor: reviewer, Action: action, EntityType: "approval", EntityID: id,
+		Detail: fmt.Sprintf("审核退役审批 asset=%s 结论=%s 意见=%s", a.AssetTag, to, note),
+	})
+	return a, nil
+}
+
+func (m *Memory) WithdrawApproval(ctx context.Context, id, actor string) (domain.DecommissionApproval, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.approvals[id]
+	if !ok {
+		return domain.DecommissionApproval{}, fmt.Errorf("%w: approval %s", ErrNotFound, id)
+	}
+	if err := domain.CanTransitionApproval(a.Status, domain.ApprovalWithdrawn); err != nil {
+		return a, fmt.Errorf("%w: %v", ErrConflict, err)
+	}
+	// 执行前才能撤回：审批一旦通过，资产开始执行（拆盘及以后）即不可撤回
+	if a.Status == domain.ApprovalApproved {
+		if asset, ok := m.assets[a.AssetID]; ok && asset.Status != domain.AssetPending {
+			return a, fmt.Errorf("%w: execution already started (asset=%s), approval cannot be withdrawn",
+				ErrConflict, asset.Status)
+		}
+	}
+	a.Status, a.UpdatedAt = domain.ApprovalWithdrawn, time.Now()
+	m.approvals[id] = a
+	m.appendAuditLocked(domain.AuditLog{
+		Actor: actor, Action: "approval.withdraw", EntityType: "approval", EntityID: id,
+		Detail: fmt.Sprintf("撤回退役审批 asset=%s version=%d", a.AssetTag, a.Version),
+	})
+	return a, nil
+}
+
 // ---- audit ----
 
 func (m *Memory) appendAuditLocked(l domain.AuditLog) {
@@ -512,9 +631,11 @@ func (m *Memory) ListAudit(ctx context.Context, f AuditFilter) ([]domain.AuditLo
 }
 
 // SeedDemoDisks creates sparse regular files standing in for block devices
-// and registers them as disks on a freshly created asset. Only used by the
-// `demo` command so the system is runnable without real hardware.
-func (m *Memory) SeedDemoDisks(ctx context.Context, dir string, operator string) (string, error) {
+// and registers them as disks on a freshly created asset. It also seeds an
+// approved decommission approval (standard = the demo's wipe standard) so the
+// approval gate is satisfied. Only used by the `demo` command so the system
+// is runnable without real hardware.
+func (m *Memory) SeedDemoDisks(ctx context.Context, dir string, operator string, standard string) (string, error) {
 	a := domain.Asset{
 		Tag: fmt.Sprintf("AST-DEMO-%03d", time.Now().Unix()%1000), Hostname: "demo-db-01",
 		Vendor: "DEMO", Model: "R740xd", SN: "DEMOSN" + domain.ID()[:8],
@@ -526,6 +647,22 @@ func (m *Memory) SeedDemoDisks(ctx context.Context, dir string, operator string)
 	}
 	created, err := m.GetAssetByTag(ctx, a.Tag)
 	if err != nil {
+		return "", err
+	}
+	// 演示审批单：负责人提交、安全员通过，与真实流程同构
+	ap := domain.DecommissionApproval{
+		AssetID: created.ID, AssetTag: created.Tag,
+		Standard: standard, Method: "destroy", Reason: "演示设备退役",
+		Applicant: operator, Version: 1,
+	}
+	if err := m.CreateApproval(ctx, ap); err != nil {
+		return "", err
+	}
+	active, err := m.GetActiveApproval(ctx, created.ID)
+	if err != nil {
+		return "", err
+	}
+	if _, err := m.ReviewApproval(ctx, active.ID, domain.ApprovalApproved, "demo-security", "演示环境预批准"); err != nil {
 		return "", err
 	}
 	now := time.Now()

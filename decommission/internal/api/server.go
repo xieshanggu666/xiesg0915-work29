@@ -49,6 +49,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/assets/{id}/disposal", s.getDisposal)
 	mux.HandleFunc("POST /api/v1/assets/{id}/disposal", s.confirmDisposal)
 	mux.HandleFunc("GET /api/v1/assets/{id}/timeline", s.assetTimeline)
+	mux.HandleFunc("POST /api/v1/assets/{id}/approvals", s.submitApproval)
+	mux.HandleFunc("GET /api/v1/assets/{id}/approvals", s.listAssetApprovals)
+
+	mux.HandleFunc("GET /api/v1/approvals/{id}", s.getApproval)
+	mux.HandleFunc("POST /api/v1/approvals/{id}/review", s.reviewApproval)
+	mux.HandleFunc("POST /api/v1/approvals/{id}/withdraw", s.withdrawApproval)
 
 	mux.HandleFunc("GET /api/v1/disks/{id}", s.getDisk)
 	mux.HandleFunc("POST /api/v1/disks/{id}/jobs", s.createJob)
@@ -206,7 +212,88 @@ func (s *Server) assetTimeline(w http.ResponseWriter, r *http.Request) {
 		jobs, _ := s.st.ListJobs(r.Context(), d.ID)
 		diskItems = append(diskItems, item{ID: d.ID, Serial: d.Serial, Status: d.Status, Events: ev, Jobs: jobs})
 	}
-	ok(w, map[string]any{"asset_events": logs, "disks": diskItems})
+	// 审批历史：每次提交及其审核/撤回事件
+	approvals, err := s.st.ListApprovals(r.Context(), id)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	type approvalItem struct {
+		domain.DecommissionApproval
+		Events []domain.AuditLog `json:"events"`
+	}
+	approvalItems := make([]approvalItem, 0, len(approvals))
+	for _, ap := range approvals {
+		ev, _, _ := s.st.ListAudit(r.Context(), store.AuditFilter{EntityType: "approval", EntityID: ap.ID, Limit: 50})
+		approvalItems = append(approvalItems, approvalItem{ap, ev})
+	}
+	ok(w, map[string]any{"asset_events": logs, "disks": diskItems, "approvals": approvalItems})
+}
+
+// ---- decommission approvals (退役审批单) ----
+
+// submitApproval: 资产负责人提交退役申请（擦除标准 + 处置方式）。
+func (s *Server) submitApproval(w http.ResponseWriter, r *http.Request) {
+	var in service.ApprovalInput
+	if !decode(w, r, &in) {
+		return
+	}
+	in.Operator = operator(r)
+	ap, err := s.svc.SubmitApproval(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	created(w, ap)
+}
+
+func (s *Server) listAssetApprovals(w http.ResponseWriter, r *http.Request) {
+	approvals, err := s.st.ListApprovals(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	ok(w, approvals)
+}
+
+func (s *Server) getApproval(w http.ResponseWriter, r *http.Request) {
+	ap, err := s.st.GetApproval(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	ok(w, ap)
+}
+
+// reviewApproval: 安全员审核。禁止申请人自审（service 层强制）。
+func (s *Server) reviewApproval(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Approve *bool  `json:"approve"`
+		Note    string `json:"note"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if body.Approve == nil {
+		fail(w, http.StatusBadRequest, "bad_request", "approve (bool) is required")
+		return
+	}
+	ap, err := s.svc.ReviewApproval(r.Context(), r.PathValue("id"), operator(r), *body.Approve, body.Note)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	ok(w, ap)
+}
+
+// withdrawApproval: 申请人执行前撤回。
+func (s *Server) withdrawApproval(w http.ResponseWriter, r *http.Request) {
+	ap, err := s.svc.WithdrawApproval(r.Context(), r.PathValue("id"), operator(r))
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	ok(w, ap)
 }
 
 // ---- disks / jobs ----

@@ -90,10 +90,28 @@ type Store interface {
 	SaveDisposal(ctx context.Context, d domain.DisposalConfirmation) error
 	GetDisposal(ctx context.Context, assetID string) (domain.DisposalConfirmation, error)
 
+	// decommission approvals (退役审批单)
+	// CreateApproval fails with ErrConflict when the asset already has an
+	// active (pending/approved) approval — one open request per asset.
+	CreateApproval(ctx context.Context, a domain.DecommissionApproval) error
+	GetApproval(ctx context.Context, id string) (domain.DecommissionApproval, error)
+	// GetActiveApproval returns the asset's pending/approved approval, or
+	// ErrNotFound when none is open.
+	GetActiveApproval(ctx context.Context, assetID string) (domain.DecommissionApproval, error)
+	// ListApprovals returns the full submission history, newest first.
+	ListApprovals(ctx context.Context, assetID string) ([]domain.DecommissionApproval, error)
+	// ReviewApproval moves pending -> approved/rejected, recording the
+	// reviewer and note atomically with an audit row.
+	ReviewApproval(ctx context.Context, id string, to domain.ApprovalStatus, reviewer, note string) (domain.DecommissionApproval, error)
+	// WithdrawApproval moves pending/approved -> withdrawn. Withdrawing an
+	// approved request is rejected once execution has started (asset no
+	// longer pending).
+	WithdrawApproval(ctx context.Context, id, actor string) (domain.DecommissionApproval, error)
+
 	// audit
 	AppendAudit(ctx context.Context, l domain.AuditLog) error
 	ListAudit(ctx context.Context, f AuditFilter) ([]domain.AuditLog, int, error)
 
 	// demo / development helper
-	SeedDemoDisks(ctx context.Context, dir string, operator string) (assetID string, err error)
+	SeedDemoDisks(ctx context.Context, dir string, operator string, standard string) (assetID string, err error)
 }

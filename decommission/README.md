@@ -1,16 +1,22 @@
 # 机房设备退役与数据擦除管理系统
 
-设备退役登记 → 拆盘 → 按标准全盘覆写 → 字节级复验 → 生成擦除证明 → 处置签收的全流程系统。
+退役审批 → 退役登记 → 拆盘 → 按标准全盘覆写 → 字节级复验 → 生成擦除证明 → 处置签收的全流程系统。
 
+- **退役审批单**：资产负责人提交退役申请（擦除标准 + 处置方式），安全员审核；**审批通过前禁止拆盘、擦除与签收**，且擦除标准 / 处置方式必须与审批一致。支持驳回重提（版本递增、历史留痕）与执行前撤回；禁止申请人自审。
 - **擦除任务与复验**：Go 实现，多道标准覆写（零 / 一 / 可重现随机流），全盘或抽样复验；多台设备并发擦除；每个 chunk 落断点并 fsync，断电/杀进程后重启从 `(道次, 偏移)` 续做。
 - **资产与证明**：PostgreSQL 存储；资产状态机、任务、断点、执行记录、擦除证明、处置签收、审计日志。审计表/执行记录/证明/签收为**只追加**（数据库触发器禁止 UPDATE/DELETE）。
 - **报告文件**：MinIO（S3 协议，内置手写 SigV4 客户端，零云 SDK 依赖）；未配置 MinIO 时自动落本地文件系统。每盘生成机器可读 JSON 报告 + 可打印 HTML《数据擦除证明》。
-- **审计**：每台设备可拉出完整时间线——谁、什么时间、做了什么。
+- **审计**：每台设备可拉出完整时间线——谁、什么时间、做了什么（含每次审批提交/审核/撤回）。
 - **处置签收不可覆盖**：一台设备只有一行签收（UNIQUE + 只追加触发器），重复签收直接 409。
 
 ## 状态机
 
 ```
+审批单  pending ──审核──→ approved ──执行前撤回──→ withdrawn(终态)
+           │  └─驳回──→ rejected(终态)              │
+           └──────执行前撤回──────→ withdrawn ──────┘
+        rejected/withdrawn 后可重新提交（新单 version+1，旧单留痕）
+
 资产  in_service → pending(退役登记) → disk_pulled(拆盘) → erasing(擦除中)
                          └──────────────┴──→ scrapped(报废) ──→ disposed(处置,终态)
                                      erasing → erasure_verified(复验通过) ──→ disposed
@@ -21,6 +27,16 @@
 任务  pending → running ⇄ (断电孤儿, 被重新领取) → verifying → verified / failed
 ```
 
+审批门禁（service 层强制，DB 另有状态机触发器兜底）：
+
+- 提交人必须是资产负责人（`owner`）；同一资产同时只允许一条活动审批单。
+- 审核人不得与申请人相同（禁止自审）；驳回必须填写审核意见。
+- 拆盘 / 创建擦除任务 / 处置签收前，资产必须持有 **approved** 审批单；
+  擦除标准、处置方式须与审批一致（例外：资产报废后允许按 `destroy` 签收——
+  物理销毁是报废资产唯一可行的终态）。
+- 撤回仅限申请人本人，且只能在执行前（资产仍为 pending）；审批单进入
+  rejected/withdrawn 后可再次提交，版本号递增。
+
 校验失败的磁盘进入 `failed`，由操作人决策：
 - `POST /disks/{id}/jobs` **重擦**（attempt + 1，每次成功各签一份证明）
 - `POST /disks/{id}/scrap` **报废**（物理销毁，资产走 scrapped 分支）
@@ -29,7 +45,8 @@
 
 ```bash
 go run ./cmd/server         # 内存存储 + 本地报告目录
-DEMO=true go run ./cmd/server   # 附带一台已拆盘的演示设备（磁盘为镜像文件）
+DEMO=true go run ./cmd/server   # 附带一台已拆盘的演示设备（磁盘为镜像文件，
+                                # 并预置一张已通过的退役审批单，标准 nist_purge）
 # 另一终端：
 curl -s localhost:8080/api/v1/standards
 curl -s -X POST -H 'X-Operator: alice' -H 'Content-Type: application/json' \
@@ -38,6 +55,20 @@ curl -s localhost:8080/api/v1/assets/<assetID>/timeline
 ```
 
 所有写接口必须带操作人：请求头 `X-Operator: <工号>`（或 `?operator=`）。
+
+非 DEMO 模式下需先走审批再执行：
+
+```bash
+# 1. 资产负责人提交退役申请（申请人须为资产 owner）
+curl -s -X POST -H 'X-Operator: <owner>' -H 'Content-Type: application/json' \
+  -d '{"standard":"nist_purge","method":"resale","reason":"服役期满"}' \
+  localhost:8080/api/v1/assets/<assetID>/approvals
+# 2. 安全员审核（不得与申请人相同；驳回需填 note）
+curl -s -X POST -H 'X-Operator: <security-officer>' \
+  -d '{"approve":true,"note":"同意"}' localhost:8080/api/v1/approvals/<approvalID>/review
+# 3. 审批通过后才允许拆盘 / 擦除 / 签收；执行前申请人可撤回：
+curl -s -X POST -H 'X-Operator: <owner>' localhost:8080/api/v1/approvals/<approvalID>/withdraw
+```
 
 CLI 端到端演示（含断电续做）：
 
@@ -57,8 +88,9 @@ go run ./cmd/cli demo --wipe --standard nist_clear --crash-at-mb 100
 ```bash
 docker compose up -d --build      # 起 postgres/minio,自动执行迁移,起 server
 # 或手动：
-psql "$DATABASE_URL" -f migrations/0001_init.sql
-go run ./cmd/cli migrate --database-url "$DATABASE_URL"
+psql "$DATABASE_URL" -f migrations/0001_init.sql -f migrations/0002_approvals.sql
+go run ./cmd/cli migrate --database-url "$DATABASE_URL"     # 0001_init.sql
+go run ./cmd/cli migrate --database-url "$DATABASE_URL" --file migrations/0002_approvals.sql
 DATABASE_URL='postgres://...' MINIO_ENDPOINT=localhost:9000 \
   MINIO_ACCESS_KEY=... MINIO_SECRET_KEY=... go run ./cmd/server
 ```
@@ -96,13 +128,18 @@ DATABASE_URL='postgres://...' MINIO_ENDPOINT=localhost:9000 \
 | `POST /api/v1/assets` | 退役登记（body: tag/vendor/model/sn/room/rack/owner…） |
 | `GET /api/v1/assets` | 资产列表（?status=&tag=&limit=&offset=） |
 | `GET /api/v1/assets/{id}` | 资产详情 |
-| `POST /api/v1/assets/{id}/disks` | 拆盘登记 `{"disks":[{serial,model,kind,capacity_gb,device_path,slot}]}` |
+| `POST /api/v1/assets/{id}/approvals` | **提交退役审批单**（负责人；body: standard/method/reason） |
+| `GET /api/v1/assets/{id}/approvals` | 该资产的审批单历史（含驳回/撤回旧单） |
+| `GET /api/v1/approvals/{id}` | 审批单详情 |
+| `POST /api/v1/approvals/{id}/review` | **安全员审核** `{"approve":true|false,"note":"..."}`；禁止自审，驳回须填 note |
+| `POST /api/v1/approvals/{id}/withdraw` | 申请人执行前撤回 |
+| `POST /api/v1/assets/{id}/disks` | 拆盘登记（需审批通过）`{"disks":[{serial,model,kind,capacity_gb,device_path,slot}]}` |
 | `GET /api/v1/assets/{id}/disks` | 设备下磁盘 |
 | `GET /api/v1/assets/{id}/certificates` | 该设备的擦除证明 |
 | `GET /api/v1/assets/{id}/timeline` | **设备审计时间线**（资产事件+每盘事件+任务） |
-| `POST /api/v1/assets/{id}/disposal` | 处置签收（reuse/resale/destroy + receiver）；重复签收 409 |
+| `POST /api/v1/assets/{id}/disposal` | 处置签收（需审批通过且方式一致；reuse/resale/destroy + receiver）；重复签收 409 |
 | `GET /api/v1/assets/{id}/disposal` | 查签收 |
-| `POST /api/v1/disks/{id}/jobs` | 创建擦除任务/重擦 `{"standard":"nist_clear"}` |
+| `POST /api/v1/disks/{id}/jobs` | 创建擦除任务/重擦（需审批通过且标准一致）`{"standard":"nist_clear"}` |
 | `POST /api/v1/disks/{id}/reverify` | 只读独立复验（发现残留则盘置 failed） |
 | `POST /api/v1/disks/{id}/scrap` | 报废 `{"reason":"..."}` |
 | `GET /api/v1/disks/{id}/jobs` | 磁盘任务历史 |
@@ -137,4 +174,5 @@ go test ./... -race
 
 覆盖：多道标准覆写与全盘复验、崩溃后断点续做（单道/三道中途断电）、篡改检出、
 抽样复验、6 盘并发擦除、失败→重擦→两证、报废、证明/签收不可覆盖、
+退役审批（负责人提交/禁止自审/驳回重提/执行前撤回/标准与处置方式门禁）、
 全流程 HTTP 集成、MinIO SigV4 签名（内置 S3 仿真服务端校验）。
