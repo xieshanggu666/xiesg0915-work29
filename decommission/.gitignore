@@ -1,0 +1,7 @@
+/.demo/
+/reports/
+/demo-disks/
+*.img
+/server
+/cli
+/decommission-*
